@@ -1,0 +1,601 @@
+#!/usr/bin/env python
+import curses
+import curses.ascii
+import sys
+import os
+import select
+import string
+
+def human_bytes(count, prec = 2):
+    sizes = ["b", "kib", "mib", "gib", "tib", "pib"]
+    index = 0
+    while count > 1024:
+        count /= 1024.0
+        index += 1
+    return round(count, prec), sizes[index]
+
+def is_del(ch):
+    return ch in [curses.ascii.DEL, 
+                  curses.KEY_DC, 
+                  curses.KEY_DL]
+
+def clear_line(window, line, xstart = 0):
+    wy, wx = window.getmaxyx()
+    for x in range(xstart, wx):
+        window.delch(line, xstart)
+
+def debug(string, *args, **kwargs):
+    sys.stderr.write(string.format(*args, **kwargs) + "\n")
+
+def cat_lists(*lists):
+    "Concatenate the given lists into a single list"
+    joined = []
+    for list in lists:
+        joined.extend(list)
+    return joined
+
+def compute_metrics(win):
+    my, mx = win.getmaxyx()
+    return my, mx, my - 1, mx - 1
+
+class TextWindow(object):
+
+    def __init__(self, win, text_funcs):
+        assert win is not None
+        self.win = win
+        self.funcs = text_funcs
+
+        (self.height, self.width,
+         self.ylast, self.xlast) = compute_metrics(self.win)
+
+    def winch(self, win):
+        return TextWindow(win, self.funcs)
+
+    def draw(self):
+        clear_line(self.win, 0)
+        output = " ".join([func() for func in self.funcs])
+        self.win.addnstr(0, 0, output, self.xlast)
+
+    def refresh(self):
+        self.win.refresh()
+
+
+class CommandWindow(object):
+
+    def __init__(self, window, buffer, prompt = None):
+        self.win = window
+        self.buffer = buffer
+        self.prompt = "" if prompt is None else prompt
+
+        self.height, self.width = self.win.getmaxyx()
+        self.ylast, self.xlast = self.height - 1, self.width - 1
+        # -1 for the cursor itself.
+        self.text_width = self.xlast - len(self.prompt)
+
+    def winch(self, win):
+        return CommandWindow(win, self.buffer, prompt = self.prompt)
+
+    def __str__(self):
+        return self.buffer
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def _longline(self, y, x, text):
+        """Write out a string of text that may be longer than 
+        the line starting at col 'x'"""
+        self.win.addstr(y, x, text[-(self.xlast - x):])
+        self.win.move(0, self.xlast)
+
+    @property
+    def content(self):
+        return self.buffer
+
+    def text(self, new_text):
+        self.win.erase()
+        return CommandWindow(self.win, new_text, prompt=self.prompt)
+
+    def clear_after(self, milliseconds):
+        select.select([], [], [], milliseconds / 1000.0)
+        return self.clear()
+
+    def clear(self):
+        return self.text("")
+
+    def delete_char(self):
+        """Deletes the caracter before the cursor. Returns None."""
+        return self.text(self.buffer[:-1])
+
+    def write_char(self, char):
+        return self.text(self.buffer + char)
+
+    def draw(self):
+        self.win.erase()
+        if self.prompt: self.win.addstr(self.prompt)
+        self._longline(0, len(self.prompt), self.buffer)
+        text_end = len(self.buffer) + len(self.prompt)
+        if text_end <= self.xlast:
+            self.win.move(0, text_end)
+
+    def refresh(self):
+        self.win.refresh()
+
+
+class TableWindow(object):
+    EMPTY = -1
+
+    @classmethod
+    def empty(cls, window):
+        "Return a new empty table window"
+        return TableWindow(window, [], TableWindow.EMPTY, TableWindow.EMPTY)
+
+    def clear(self):
+        "Remove all entries of this table window"
+        return TableWindow(self.win, [], TableWindow.EMPTY, TableWindow.EMPTY)
+
+    def append(self, lines, view = None):
+        "Append the given lines to the window. Doesn't change the index."
+        new_lines = self.lines + lines
+        new_index = self.index
+        new_base = self.base
+        if view is not None:
+            new_base, new_index = view
+        elif len(new_lines) > 0 and self.index == TableWindow.EMPTY:
+            new_index = new_base = 0
+        elif len(new_lines) == 0:
+            new_index = new_base = TableWindow.EMPTY
+        return TableWindow(self.win, new_lines, new_base, new_index)
+
+    def prepend(self, lines):
+        "Prepend the given lines to the window. Doesn't change the index."
+        new_lines = lines + self.lines
+        new_index = len(lines) + self.index
+        new_base = len(lines) + self.base
+        if len(new_lines) > 0 and self.index == TableWindow.EMPTY:
+            new_index = new_base = 0
+        elif len(new_lines) == 0:
+            new_index = new_base = TableWindow.EMPTY
+        return TableWindow(self.win, new_lines, new_base, new_index)
+
+    def next(self):
+        if self.index == len(self.lines) - 1: 
+            return self
+        new_index = self.index + 1
+        new_base = self.base
+        if new_index > (self.base + self.ylast):
+            new_base += 1
+        return TableWindow(self.win, self.lines, new_base, new_index)
+
+    def prev(self):
+        if self.index == 0: return self
+        new_index = self.index - 1
+        new_base = self.base
+        if new_index < self.base:
+            new_base -= 1
+        return TableWindow(self.win, self.lines, new_base, new_index)
+
+    def next_page(self):
+        new_index = self.index
+        new_base = self.base
+
+        next_base = new_base + self.height
+        # Test to see if there are enough items to fill another window, if
+        # so, then advance the index and the base by next_base
+        if (len(self.lines) - 1) > (next_base + self.height):
+            new_index = new_base = next_base
+        # If there's *not* enough items to fill another window once we advance
+        # the base, then adjust the current base so that it can show
+        # the items we can't see right now.
+        elif (len(self.lines) - 1) > next_base:
+            new_base += len(self.lines) - next_base 
+            new_index = new_base
+        # If there are no more items to show, just point to the last item
+        # in the list.
+        else:
+            new_index = len(self.lines) - 1
+        return TableWindow(self.win, self.lines, new_base, new_index)
+
+    def prev_page(self):
+        new_base = max(self.base - self.height, 0)
+        new_index = max(new_base + self.ylast, 0)
+        # Special case where we've already reached the top of the list.
+        if self.base == 0: new_index = 0
+        return TableWindow(self.win, self.lines, new_base, new_index)
+
+    def top(self):
+        return TableWindow(self.win, self.lines, 0, 0)
+
+    def bottom(self):
+        new_index = len(self.lines) - 1
+        new_base = max(new_index - self.ylast, 0)
+        return TableWindow(self.win, self.lines, new_base, new_index)
+
+    def winch(self, win):
+        return TableWindow(win, self.lines, self.base, self.index)
+    
+    def __init__(self, window, lines, base, index, no_erase=False):
+        assert window is not None
+        assert index < len(lines)
+        assert TableWindow.EMPTY <= base <= index
+        assert index >= TableWindow.EMPTY
+
+        self.win = window
+        self.lines = lines 
+        self.base = base 
+        self.index = index
+        self._no_erase = no_erase
+
+        (self.height, self.width,
+         self.ylast, self.xlast) = compute_metrics(self.win)
+
+    @property
+    def current(self):
+        return self.lines[self.index]
+
+    def _fill_line(self, line, length):
+        return line + (" " * (length - len(line)))
+
+    def draw(self):
+        rows = min(self.height, len(self.lines) - self.base)
+        for line in range(rows):
+            clear_line(self.win, line)
+            abs_index = self.base + line
+            full = self._fill_line(str(self.lines[abs_index]), self.xlast)
+            if abs_index == self.index:
+                self.win.addnstr(line, 0, full, self.xlast, curses.A_REVERSE)
+            else:
+                self.win.addnstr(line, 0, full, self.xlast)
+
+    def refresh(self):
+        self.win.refresh()
+
+
+class Entry(object):
+    # Printed When we cross a directory level.
+    DIR_LEVEL = "|"
+    # Printed as padding between levels
+    DIR_PAD = "   "
+    # Printed before a new entry.
+    START = "---"
+
+    def _build_tree(self, path, **kwargs):
+        items = []
+        for entry in sorted(os.listdir(path)):
+            items.append(Entry(os.path.join(path, entry), **kwargs))
+        return items
+
+    def __init__(self, path, parent=None, level=0, selected=False, collapsed=True):
+        self.path = path
+        self.parent = parent
+        self._selected = selected 
+        self.collapsed = collapsed
+        self.level = level
+
+        if self.directory:
+            self.tree = self._build_tree(path, parent=self,
+                                               level=level + 1,
+                                               selected=selected,
+                                               collapsed=collapsed)
+            self._children_changed(notify=False)
+        else:
+            stat = os.stat(path)
+            self._size = stat.st_size
+
+    def _children_changed(self, notify=True):
+        if self.directory:
+            self._size = sum(map(lambda x: x.size, self.tree))
+            self._selected = all(x.selected for x in self.tree)
+        if notify and self.parent:
+            self.parent._children_changed(notify=True)
+
+    def _set_selected(self, value, notify=True):
+        if self.file and value != self._selected:
+            self._selected = value
+        elif self.directory:
+            for item in self.tree: 
+                item._set_selected(value, notify=False)
+        self._children_changed(notify=notify)
+
+    def expanded_list(self):
+        "Returns a list of entries that are expanded."
+        expanded = [self]
+        if not self.collapsed and self.directory:
+            next_set = map(lambda x: x.expanded_list(), self.tree)
+            expanded += cat_lists(*next_set)
+        return expanded
+
+    @property
+    def size(self):
+        if self.file: 
+            return self._size if self.selected else 0
+        else:
+            return self._size
+
+    @property
+    def size_string(self):
+        value, units = human_bytes(self.size)
+        return "{0}{1}".format(value, units)
+
+    @property
+    def selected(self):
+        return self._selected
+
+    @selected.setter
+    def selected(self, value):
+        self._set_selected(value)
+
+    @property
+    def selected_below(self):
+        if self.selected: 
+            return True
+        elif self.directory:
+            return any(x.selected_below for x in self.tree)
+        else:
+            return False
+
+    @property
+    def directory(self):
+        return os.path.isdir(self.path)
+
+    @property
+    def file(self):
+        return os.path.isfile(self.path)
+
+    def __str__(self):
+        prefix = ""
+        for i in range(self.level, 0, -1):
+            prefix += self.DIR_LEVEL + (self.DIR_PAD if i > 1 else self.START)
+        return prefix \
+               + ("[" + ("X" if self.selected else " ") + "] ") \
+               + self.size_string + " ~ " \
+               + os.path.split(self.path)[1] 
+
+
+class Screen(object):
+    # Height of the command window
+    COMMANDW_HEIGHT = 1
+    COMMANDW_PROMPT = ": "
+
+    def start_curses(self):
+        self.std = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+
+    def partition_window(self):
+        my, mx = self.std.getmaxyx()
+        high = self.std.subwin(my - Screen.COMMANDW_HEIGHT, mx, 0, 0)
+        low  = self.std.subwin(Screen.COMMANDW_HEIGHT, mx,
+                               my - Screen.COMMANDW_HEIGHT, 0)
+        return high, low
+
+    def close(self):
+        curses.endwin()
+
+    def _total_size(self):
+        return "Total Size: {0}".format(self.root.size_string)
+
+    def __init__(self, dir_root):
+        self.start_curses()
+        self.root = dir_root
+
+        high, low = self.partition_window()
+        self.main = TableWindow.empty(high)
+        self.text = TextWindow(low, [self._total_size])
+        self.com = CommandWindow(low, "", prompt=Screen.COMMANDW_PROMPT)
+
+        self.main = self.main.append(root.expanded_list())
+
+    def winch(self):
+        high, low = self.partition_window()
+        self.main = self.main.winch(high)
+        self.com = self.com.winch(low)
+        self.text = self.text.winch(low)
+
+    def draw(self):
+        self.main.draw()
+        self.com.draw()
+        self.text.draw()
+
+    def _update_contents(self):
+        old = self.main
+        self.main = self.main.clear()
+        self.main = self.main.append(self.root.expanded_list(), 
+                                     view=(old.base, old.index))
+
+    def _dump(self, node):
+        if node.file and node.selected:
+            sys.stderr.write("+ {0}\n".format(node.path))
+        elif node.directory and node.selected_below:
+            sys.stderr.write("+ {0}/\n".format(node.path))
+        if node.directory:
+            map(self._dump, node.tree)
+
+    # Commands:
+    def dump(self):
+        self.close()
+        self._dump(self.root)
+        sys.stderr.write("- *\n")
+        sys.exit(0)
+
+    def next(self):
+        self.main = self.main.next()
+
+    def prev(self):
+        self.main = self.main.prev()
+
+    def next_page(self):
+        self.main = self.main.next_page()
+
+    def prev_page(self):
+        self.main = self.main.prev_page()
+
+    def top(self):
+        self.main = self.main.top()
+
+    def bottom(self):
+        self.main = self.main.bottom()
+
+    def expand_current(self):
+        self.main.current.collapsed = False
+        self._update_contents()
+
+    def collapse_current(self):
+        self.main.current.collapsed = True
+        self._update_contents()
+
+    def toggle_select_current(self):
+        self.main.current.selected = not self.main.current.selected
+        self._update_contents()
+        self.next()
+
+# Mode Commands
+MODE_CONT, MODE_EXIT, MODE_SWITCH = range(3)
+DEFAULT_MODE = "selection"
+
+class Selection(object):
+
+    def __init__(self, screen):
+        self.screen = screen
+
+    def __call__(self, ch):
+        ch = chr(ch)
+        if ch in BINDINGS:
+            getattr(screen, BINDINGS[ch])()
+        return (MODE_CONT,)
+
+    def draw(self):
+        self.screen.main.draw()
+        self.screen.text.draw()
+
+    def refresh(self):
+        self.screen.main.refresh()
+        self.screen.text.refresh()
+
+class Command(object):
+
+    def __init__(self, screen):
+        self.screen = screen
+
+    def do_command(self, command):
+        if hasattr(screen, command.lower()):
+            getattr(screen, command.lower())()
+            self.screen.com = self.screen.com.clear()
+            return (MODE_SWITCH, DEFAULT_MODE)
+        else:
+            self.screen.com = self.screen.com.text("Not a valid command.")
+            self.draw()
+            self.refresh()
+            self.screen.com = self.screen.com.clear_after(700)
+            return (MODE_CONT,)
+
+    def __call__(self, ch):
+        char = chr(ch)
+        new_com = self.screen.com
+        if char == '\n':
+            return self.do_command(self.screen.com.content)
+        elif ch == curses.ascii.DEL:
+            new_com = self.screen.com.delete_char()
+        else:
+            new_com = self.screen.com.write_char(char)
+        self.screen.com = new_com
+        return (MODE_CONT,)
+
+    def draw(self):
+        self.screen.main.draw()
+        self.screen.com.draw()
+
+    def refresh(self):
+        self.screen.main.refresh()
+        self.screen.com.refresh()
+
+BINDINGS = dict(
+    j = "next", 
+    k = "prev", f = "next_page", 
+    b = "prev_page",
+    e = "expand_current",
+    c = "collapse_current",
+    s = "toggle_select_current",
+    g = "top",
+    G = "bottom",
+    D = "dump"
+)
+
+MODE_BINDINGS = {
+    ord(":"): "command"
+}
+
+MODES = dict(
+    selection = Selection,
+    command = Command 
+)
+
+def run(s):
+    s.main.draw()
+    s.main.refresh()
+
+    mode = MODES[DEFAULT_MODE](s)
+    while True:
+        do_break = False
+        ch = s.std.getch()
+        if ch == curses.KEY_RESIZE:
+            s.winch()
+        elif ch in MODE_BINDINGS:
+            mode = MODES[MODE_BINDINGS[ch]](s)
+        else:
+            command = mode(ch)
+            if command[0] == MODE_EXIT: 
+                break
+            elif command[0] == MODE_SWITCH:
+                mode = MODES[command[1]](s)
+            elif command[0] == MODE_CONT:
+                pass
+            else:
+                assert False, "Mode returned bad command."
+        mode.draw()
+        mode.refresh()
+
+def find_entry(root, path):
+    if path == root.path: return root
+    if root.directory:
+        for entry in root.tree:
+            if string.find(path, entry.path) != -1:
+                found = find_entry(entry, path) 
+                if found is not None: return found
+    return None
+
+def select_entry(root, path):
+    entry = find_entry(root, path)
+    if entry is not None and not entry.directory:
+        entry.selected = True
+
+def path_join(a, b):
+    if a[-1] == "/": a = a[:-1]
+    if b[0] == "/": b = b[1:]
+    return "/".join((a, b))
+
+if __name__ == "__main__":
+    import locale
+    from argparse import ArgumentParser
+    locale.setlocale(locale.LC_ALL, "")
+
+    parser = ArgumentParser()
+    parser.add_argument("path")
+    parser.add_argument("-l", "--load", nargs=1, 
+                        help="Load a previously generated rsync exclude file.")
+    args = parser.parse_args()
+    root = Entry(args.path, selected=False, collapsed=True) 
+    if args.load:
+        with open(args.load[0], "r") as f:
+            for line in f:
+                vs = line.strip().split(" ")
+                action = vs[0]
+                loc = path_join(args.path, " ".join(vs[1:]))
+                print "looking for:", loc
+                if action == "+": 
+                    select_entry(root, loc)
+
+    try:
+        screen = Screen(root)
+        run(screen)
+    finally:
+        curses.endwin()

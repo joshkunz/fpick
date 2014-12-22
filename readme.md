@@ -25,14 +25,14 @@ the program.
 #### Mode Switching
 
 | Key | Action |
-|-----|--------|
+|:---:|--------|
 | `:` | Switch from selection mode to command mode. |
 | `ESC` | Switch from command mode to selection mode. |
 
 #### Selection Mode Bindings
 
 | Key | Action |
-|-----|--------|
+|:---:|--------|
 | `j` | Highlight the next element in the list. (Move Down) | 
 | `k` | Highlight the previous element in the list. (Move Up) | 
 | `f` | Scroll to the next page of elements. |
@@ -53,7 +53,7 @@ selection-mode key binding for the command. All selection-mode keys are
 just bindings to command-mode commands.
 
 | Command | Key | Action |
-|---------|-----|--------|
+|---------|:---:|--------|
 | `quit` |  | Exit the program.|
 | `dump` | `D` | Dump the current selections to stderr as an rsync exclude file. |
 | `next` | `j` | Highlight the next element in the list. |

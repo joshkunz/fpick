@@ -237,7 +237,7 @@ class TableWindow(object):
 
     def draw(self):
         rows = min(self.height, len(self.lines) - self.base)
-        for line in range(rows):
+        for line in xrange(rows):
             clear_line(self.win, line)
             abs_index = self.base + line
             full = self._fill_line(str(self.lines[abs_index]), self.xlast)
@@ -245,6 +245,9 @@ class TableWindow(object):
                 self.win.addnstr(line, 0, full, self.xlast, curses.A_REVERSE)
             else:
                 self.win.addnstr(line, 0, full, self.xlast)
+        full = " " * self.xlast
+        for extra in xrange(self.height - rows):
+            self.win.addnstr(rows + extra, 0, full, self.xlast)
 
     def refresh(self):
         self.win.refresh()
@@ -411,6 +414,10 @@ class Screen(object):
             map(self._dump, node.tree)
 
     # Commands:
+    def quit(self):
+        self.close()
+        sys.exit(0)
+
     def dump(self):
         self.close()
         self._dump(self.root)
@@ -510,7 +517,8 @@ class Command(object):
 
 BINDINGS = dict(
     j = "next", 
-    k = "prev", f = "next_page", 
+    k = "prev", 
+    f = "next_page", 
     b = "prev_page",
     e = "expand_current",
     c = "collapse_current",
@@ -521,7 +529,8 @@ BINDINGS = dict(
 )
 
 MODE_BINDINGS = {
-    ord(":"): "command"
+    ord(":"): "command",
+    curses.ascii.ESC: "selection"
 }
 
 MODES = dict(

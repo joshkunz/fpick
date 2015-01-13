@@ -406,10 +406,13 @@ class Screen(object):
                                      view=(old.base, old.index))
 
     def _dump(self, node):
+        fixed_path = node.path.lstrip(self.root.path)
+        if fixed_path != "" and fixed_path[0] != "/": 
+            fixed_path = "/" + fixed_path
         if node.file and node.selected:
-            sys.stderr.write("+ {0}\n".format(node.path))
+            sys.stderr.write("+ {0}\n".format(fixed_path))
         elif node.directory and node.selected_below:
-            sys.stderr.write("+ {0}/\n".format(node.path))
+            sys.stderr.write("+ {0}/\n".format(fixed_path))
         if node.directory:
             map(self._dump, node.tree)
 

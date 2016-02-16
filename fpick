@@ -19,6 +19,9 @@ def is_del(ch):
                   curses.KEY_DC, 
                   curses.KEY_DL]
 
+def strip_leading(leading, from_):
+    return from_[len(leading):]
+
 def clear_line(window, line, xstart = 0):
     wy, wx = window.getmaxyx()
     for x in range(xstart, wx):
@@ -406,7 +409,7 @@ class Screen(object):
                                      view=(old.base, old.index))
 
     def _dump(self, node):
-        fixed_path = node.path.lstrip(self.root.path)
+        fixed_path = strip_leading(self.root.path, node.path)
         if fixed_path != "" and fixed_path[0] != "/": 
             fixed_path = "/" + fixed_path
         if node.file and node.selected:
